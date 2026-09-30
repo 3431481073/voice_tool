@@ -1,0 +1,14 @@
+# 语音悬浮球 —— 直接依赖
+# 版本取自本机 venv 实测（2026-09-30），非推测。
+
+PySide6==6.11.2
+faster-whisper==1.2.1
+PyAudio==0.2.14
+pynput==1.8.2
+pyperclip==1.11.0
+numpy==2.5.2
+
+# faster-whisper 的 GPU 后端与 CUDA 运行库
+ctranslate2==4.8.1
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.25.1.1
