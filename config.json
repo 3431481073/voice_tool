@@ -1,9 +1,10 @@
 {
-  "whisper_model": "medium",
+  "whisper_model": "large-v3-turbo",
   "hotkey": "<ctrl>+<alt>+<space>",
   "ball_pos": [
-    1067,
-    109
+    1041,
+    8
   ],
-  "mic_device": null
+  "mic_device": null,
+  "language": "zh"
 }

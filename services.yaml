@@ -1,0 +1,36 @@
+# voice_tool（语音悬浮球）的服务声明
+#
+# 结论：没有常驻服务。
+#
+# 理由：
+#   1. 不监听任何端口。
+#   2. 没有计划任务、没有服务定义、没有守护。
+#   3. 它是用户的应用 —— 双击运行、托盘退出。
+#
+# ⚠️ 但有一个【常驻进程】（不是服务）：
+#    悬浮球本体 —— voice_ball.py 跑在 venv\Scripts\pythonw.exe 里（无控制台窗口）。
+#    它一直活着（画球 + 监听全局热键），但【不监听端口】。
+#    实测：PID 6940，父进程 explorer.exe。
+#    → 按 PLAYBOOK 步骤 3 的口径"常驻服务才记"，这种"GUI 常驻进程"不记成服务条目。
+#
+# ⚠️ 单实例用的是【命名管道】，不是端口：
+#    QLocalServer / QLocalSocket，名字 VoiceBall_SingleInstance。
+#    代码里的理由：开机自启 + 手动点 bat 会叠出两个悬浮球（两份 CUDA 上下文、
+#    两个全局热键监听、两份 1.5GB 模型）。
+#
+# 🔴 外部持久状态（唯一一处往项目外写的东西）：
+#    HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+#        名称: VoiceBall
+#        实测值(2026-10-03 只读查询):
+#          "D:\MyProject\voice_tool\venv\Scripts\pythonw.exe" "D:\MyProject\voice_tool\voice_ball.py"
+#        状态: 【开着】
+#    ⚠️ 值是【绝对路径】—— 搬动项目会让自启【静默失效】（开机什么都不发生，不报错）。
+#       自愈: 在新位置跑一次 → set_autostart(True)。
+#    代码: voice_ball.py L1515-1516（常量）· L1551-1579（三个函数）
+#
+# ⚠️ 没有外部前置条件：不依赖任何别的项目在跑。
+#    （NVIDIA GPU 不是硬性的 —— 代码里有 CPU 回退。）
+#
+# 详见 docs/service.md
+
+services: []

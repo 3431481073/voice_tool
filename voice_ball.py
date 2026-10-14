@@ -119,6 +119,27 @@ GAIN = 5.5          # 灵敏度增益：越大越灵敏，波浪越容易跳起�
 TAIL_S = 0.6        # 点停止后继续收尾音的时长，避免最后几个字被驱动缓冲吞掉
 IDLE_UNLOAD_S = 300  # 转写结束后多久自动释放模型（5 分钟），把约 1.9GB 显存还回去
 
+# ---------------------------------------------------------------------------
+# Whisper 解码参数 —— 针对本机实测到的三种失效模式（对 300 秒长录音实测）：
+#
+#  1. condition_on_previous_text（库默认 True）把上一段输出当提示喂回解码器，
+#     长音频上会漂移、复读、串词。实测同一条录音：
+#        默认  : 643 字，最高重复片段「搜索框」出现 24 次，结尾整段复读
+#        关掉后: 135 字，最高重复 2 次，耗时 14.9s -> 2.8s
+#  2. 不指定 language 会漂到英文。实测默认下 ASCII 字母占比 32%
+#     （整段英文菜谱幻觉 "Put it in the oven..."）；指定 zh 后降到 0%，
+#     并且从繁体漂移回到简体。
+#  3. temperature 默认带回退（升温重试），导致同一条音频两次结果不同 ——
+#     之前排查时见过同一文件两次转写出完全不同的乱码。固定 0 保证可复现。
+#
+# 刻意【不用】initial_prompt（曾试过，已回退）：
+# 加上"请加上标点符号"这类提示能让长音频带回标点，但实测在 2 秒短录音上模型会
+# **把提示词原文当结果吐出来** —— 输出变成"请加上标点符号。"，正确内容整段丢失。
+# 标点只是锦上添花，不能拿短录音的正确性去换。所以宁可不加。
+TRIM_PEAK_MAX = 2    # 首尾裁剪的"静音"阈值：只裁真正的数字零，不动环境底噪
+DECODE_ARGS = dict(vad_filter=True, condition_on_previous_text=False,
+                   temperature=0.0, beam_size=5)
+
 # 悬浮球尺寸
 BALL_R = 33          # 球体半径
 PAD = 20             # 阴影/光晕留白
@@ -131,8 +152,24 @@ ACCENT_WORK = QColor("#4d9fff")   # 转写：蓝
 FG = QColor("#ffffff")
 
 
+def resolve_model_path(cfg):
+    """按 config 的 whisper_model 决定用本地哪个模型目录。
+
+    config 写 "large-v3-turbo" 就用 models/faster-whisper-large-v3-turbo，
+    写 "medium" 就用 models/faster-whisper-medium。目录不存在则退回默认模型，
+    避免改错一个配置项就直接用不了。
+    """
+    name = str((cfg or {}).get("whisper_model") or "medium").strip()
+    cand = os.path.join(BASE_DIR, "models", f"faster-whisper-{name}")
+    if os.path.isdir(cand):
+        return cand
+    log.warning("本地没有 %s，回退到 %s", cand, MODEL_DIR)
+    return MODEL_DIR
+
+
 def load_config():
-    default = {"whisper_model": "medium", "ball_pos": None, "mic_device": None}
+    default = {"whisper_model": "medium", "ball_pos": None, "mic_device": None,
+               "language": "zh"}
     cfg = {}
     try:
         # utf-8-sig：容忍带 BOM 的文件。之前用 PowerShell Set-Content 写回过一次，
@@ -336,6 +373,25 @@ def spectral_centroid(x, rate):
         return 0.0
     f = np.fft.rfftfreq(seg.size, 1.0 / rate)
     return float((f * S).sum() / tot)
+
+
+def trim_edge_silence(frames, max_peak=TRIM_PEAK_MAX):
+    """裁掉首尾的纯数字静音。
+
+    实测每次录音开头都有约 400ms 的零填充（设备启动期，预热逻辑会把它一并收下），
+    结尾还有 0.6s 尾音。把整段零喂给 Whisper 是它开头产生幻觉的经典诱因。
+    阈值取得很小，只裁真正的数字零，不碰环境底噪（活麦克风有抖动，峰值几十到几百）。
+    """
+    def peak_of(b):
+        a = np.frombuffer(b, dtype=np.int16)
+        return int(np.max(np.abs(a))) if a.size else 0
+
+    i, j = 0, len(frames)
+    while i < j and peak_of(frames[i]) <= max_peak:
+        i += 1
+    while j > i and peak_of(frames[j - 1]) <= max_peak:
+        j -= 1
+    return frames if i >= j else frames[i:j]
 
 
 def classify_stats(st):
@@ -804,13 +860,15 @@ class Controller:
         self._loading = True
         self._model_ready.clear()
         t0 = time.time()
+        model_path = resolve_model_path(self.cfg)
+        log.info("加载模型：%s", os.path.basename(model_path))
         try:
-            self.model = WhisperModel(MODEL_DIR, device="cuda", compute_type="float16")
+            self.model = WhisperModel(model_path, device="cuda", compute_type="float16")
             self.device = "cuda"
         except Exception:
             log.warning("CUDA 加载失败，回退 CPU", exc_info=True)
             try:
-                self.model = WhisperModel(MODEL_DIR, device="cpu", compute_type="int8")
+                self.model = WhisperModel(model_path, device="cpu", compute_type="int8")
                 self.device = "cpu"
             except Exception as e:
                 self.model = None
@@ -840,6 +898,14 @@ class Controller:
         if self.model_loaded or self._loading:
             return
         self._load_model()
+
+    def _transcribe_kwargs(self):
+        """Whisper 解码参数。默认中文；配置里写 auto 就交给模型自动判定。"""
+        kw = dict(DECODE_ARGS)
+        lang = str(self.cfg.get("language") or "zh").strip()
+        if lang.lower() not in ("auto", "", "none"):
+            kw["language"] = lang
+        return kw
 
     def _wait_model(self, timeout=60.0):
         """等模型加载完（非常驻模式下录音结束时可能还在装）。"""
@@ -980,6 +1046,15 @@ class Controller:
                 f"未检测到有效语音（峰值 {st['peak']}，通路 {label}）")
             return
 
+        # 裁掉首尾的数字静音再落盘：开头那段是设备启动期的零填充，
+        # 整段零喂给 Whisper 是它开头幻觉的经典诱因。
+        trimmed = trim_edge_silence(frames)
+        if len(trimmed) < len(frames):
+            log.info("首尾静音裁剪：%d -> %d 帧（去掉 %.2fs）",
+                     len(frames), len(trimmed),
+                     (len(frames) - len(trimmed)) * CHUNK / float(rate))
+        frames = trimmed
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         audio_file = os.path.join(AUDIO_DIR, f"{timestamp}.wav")
         try:
@@ -1008,9 +1083,12 @@ class Controller:
         text = ""
         try:
             t0 = time.time()
-            segments, info = self.model.transcribe(audio_file)
+            kw = self._transcribe_kwargs()
+            segments, info = self.model.transcribe(audio_file, **kw)
             text = "".join(seg.text for seg in segments).strip()
-            log.info("转写完成：耗时=%.1fs 字数=%d", time.time() - t0, len(text))
+            log.info("转写完成：耗时=%.1fs 字数=%d（参数 %s）",
+                     time.time() - t0, len(text),
+                     "language=%s" % kw.get("language", "auto"))
         except Exception as e:
             log.error("转写失败", exc_info=True)
             self.bridge.error.emit(f"转写失败：{e}（详见日志）")
@@ -1530,19 +1608,102 @@ def normalize_hotkey(hotkey):
     return hotkey
 
 
+# ---------------------------------------------------------------------------
+# 热键状态对账
+#
+# 背景：pynput 的 HotKey 用长期存活的 _state 集合，只在收到 release 时才移除键
+# （keyboard/__init__.py:178-201）。低级键盘钩子一旦漏事件（回调超时被系统摘钩、
+# UAC/锁屏期间丢事件、程序在按键按着时重启），那个键就永远留在 _state 里，之后
+# 少按一个键也能凑齐集合 —— 用户实测过"只按 Ctrl+Alt 就启动了"。
+#
+# 踩过的坑：一开始在【触发时】回查物理按键、不满足就忽略。方向错了 ——
+# pynput 是"钩子收事件 -> 队列 -> 再回调"，快速敲击时回调跑到时键已经松开，
+# 于是把正常按键也挡掉了，用户反馈"要点很多很多次才能打开"。
+#
+# 现在的做法：看门狗定期对账，物理上没按着的键就从 pynput 状态里删掉。
+# 它【完全不碰触发路径】，所以在构造上不可能误伤正常按键。
+# ---------------------------------------------------------------------------
+_VK_ALIASES = {
+    0x11: (0x11, 0xA2, 0xA3),   # VK_CONTROL / LCONTROL / RCONTROL
+    0x12: (0x12, 0xA4, 0xA5),   # VK_MENU    / LMENU    / RMENU
+    0x10: (0x10, 0xA0, 0xA1),   # VK_SHIFT   / LSHIFT   / RSHIFT
+}
+HOTKEY_WATCHDOG_S = 0.3
+_hotkey_watchdog_thread = None
+
+
+def _key_vk(key):
+    """从 pynput 的键对象取 Win32 虚拟键码。
+
+    pynput 里修饰键是 Key 枚举（vk 在 .value.vk 上），普通键是 KeyCode（vk 直接在
+    对象上），所以两条路都要看。实测：Key.ctrl -> 17、Key.alt -> 18、space -> 32。
+    """
+    v = getattr(key, "vk", None)
+    if isinstance(v, int):
+        return v
+    v = getattr(getattr(key, "value", None), "vk", None)
+    return v if isinstance(v, int) else None
+
+
+def _vk_down(vk):
+    """这个键此刻物理上按着吗？查不出来时返回 True（保守：绝不清状态）。"""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        return any(u.GetAsyncKeyState(v) & 0x8000
+                   for v in _VK_ALIASES.get(vk, (vk,)))
+    except Exception:
+        log.warning("查询按键物理状态失败", exc_info=True)
+        return True
+
+
+def _reconcile_hotkey_state():
+    """对账一次，返回被清理掉的键（便于测试与日志）。"""
+    cleaned = []
+    try:
+        for hk in getattr(_hotkey_listener, "_hotkeys", None) or []:
+            st = getattr(hk, "_state", None)
+            if not st:
+                continue
+            for k in list(st):           # 先复制：pynput 线程可能在并发改它
+                vk = _key_vk(k)
+                if vk is not None and not _vk_down(vk):
+                    st.discard(k)
+                    cleaned.append(k)
+    except Exception:
+        log.warning("热键状态对账异常", exc_info=True)
+    return cleaned
+
+
+def _hotkey_watchdog():
+    """定期把 pynput 卡住的按键状态与物理状态对账。"""
+    while True:
+        time.sleep(HOTKEY_WATCHDOG_S)
+        for k in _reconcile_hotkey_state():
+            log.info("热键状态对账：清理残留按键 %s（物理上并未按下）", k)
+
+
 def start_hotkey(bridge, hotkey):
     """注册全局快捷键切换录音（默认 Ctrl+Alt+Space）。
 
     注意：pynput 的监听器跑在自己的线程里，绝不能在那里直接改控制器状态。
     这里只发一个信号，由 Qt 派发回 GUI 线程执行，避免跨线程状态竞争。
     """
-    global _hotkey_listener
+    global _hotkey_listener, _hotkey_watchdog_thread
     try:
         from pynput import keyboard
+
+        # 触发路径上不做任何门禁 —— 只发信号。状态卡住的问题交给看门狗去修。
         _hotkey_listener = keyboard.GlobalHotKeys(
             {hotkey: lambda: bridge.toggle_requested.emit()})
         _hotkey_listener.start()
         log.info("全局快捷键已注册：%s", hotkey)
+
+        if _hotkey_watchdog_thread is None:
+            _hotkey_watchdog_thread = threading.Thread(
+                target=_hotkey_watchdog, daemon=True, name="hotkey-watchdog")
+            _hotkey_watchdog_thread.start()
+            log.info("热键状态看门狗已启动（每 %.1fs 对账一次）", HOTKEY_WATCHDOG_S)
     except Exception as e:
         # 以前这里只 print()，而 pythonw 下 stdout 是丢弃的，失败完全无声
         log.error("快捷键注册失败：%s", e, exc_info=True)
